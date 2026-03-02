@@ -49,6 +49,9 @@ var DirectSocketsLibrary = {
           return toRead;
         }
 
+        // Check for read errors before reporting EOF
+        if (sock.error) throw new FS.ErrnoError(sock.error);
+
         // EOF
         if (sock._bgReaderDone) return 0;
 
@@ -108,6 +111,12 @@ var DirectSocketsLibrary = {
     },
 
     createSocketState(family, type, protocol) {
+#if ASSERTIONS
+      if (typeof globalThis.TCPSocket === 'undefined' &&
+          typeof globalThis.UDPSocket === 'undefined') {
+        abort('Direct Sockets API is not available. DIRECT_SOCKETS requires a Chrome Isolated Web App (IWA) context. See https://wicg.github.io/direct-sockets/');
+      }
+#endif
       DIRECT_SOCKETS.ensureRoot();
 
       // Create an FS node + stream so that write()/read() on this fd
@@ -222,10 +231,11 @@ var DirectSocketsLibrary = {
       })();
     },
 
-    // Parse a sockaddr struct from Wasm memory and return {addr, port} as strings.
+    // Parse a sockaddr struct from Wasm memory.
+    // Returns {family, addr, port} on success, or {errno} on failure.
     parseSockaddr(addrPtr, addrLen) {
       var info = readSockaddr(addrPtr, addrLen);
-      if (info.errno) return null;
+      if (info.errno) return { errno: info.errno };
       // readSockaddr returns addr as a string like "1.2.3.4" and port as a number.
 
       // First check our DoH reverse cache - if this IP was resolved by us,
@@ -346,7 +356,8 @@ var DirectSocketsLibrary = {
         return result;
       }
 
-      // Queue is empty
+      // Queue is empty - check for errors before reporting EOF
+      if (sock.error) return -{{{ cDefs.EIO }}};
       if (sock._bgReaderDone) return null;  // EOF
 
       // Non-blocking: return EAGAIN sentinel
@@ -369,8 +380,10 @@ var DirectSocketsLibrary = {
               sock.recvQueue[0] = chunk.slice(length);
               resolve(result);
             }
+          } else if (sock.error) {
+            resolve(-sock.error);  // Return negative errno
           } else {
-            // EOF or error
+            // EOF
             resolve(null);
           }
         };
@@ -401,26 +414,25 @@ var DirectSocketsLibrary = {
 
     // Compute poll revents for a socket
     computeRevents(sock, events) {
+      var POLLRDNORM = 64, POLLWRNORM = 256;
       var revents = 0;
-      if (events & 1 /*POLLIN*/) {
+      if (events & {{{ cDefs.POLLIN }}}) {
         if (sock.recvQueue.length > 0) {
-          revents |= 1 | 64; // POLLIN | POLLRDNORM
+          revents |= {{{ cDefs.POLLIN }}} | POLLRDNORM;
         } else if (sock._bgReaderDone) {
-          revents |= 16; // POLLHUP
+          revents |= {{{ cDefs.POLLHUP }}};
         }
-        // Listening sockets: can't check readiness synchronously, leave revents=0
-        // Callers should use blocking accept() instead
       }
-      if (events & 4 /*POLLOUT*/) {
+      if (events & {{{ cDefs.POLLOUT }}}) {
         if ((sock.state === 'connected' || sock.state === 'bound') && sock.writer) {
-          revents |= 4 | 256; // POLLOUT | POLLWRNORM
+          revents |= {{{ cDefs.POLLOUT }}} | POLLWRNORM;
         }
       }
       if (sock.error) {
-        revents |= 8; // POLLERR
+        revents |= {{{ cDefs.POLLERR }}};
       }
       if (sock._bgReaderDone && sock.recvQueue.length === 0) {
-        revents |= 16; // POLLHUP
+        revents |= {{{ cDefs.POLLHUP }}};
       }
       return revents;
     },
@@ -465,13 +477,58 @@ var DirectSocketsLibrary = {
   // Pipes - in-memory pipes for pipe()/socketpair()
   // ---------------------------------------------------------------------------
 
-  $DIRECT_SOCKETS_PIPES__deps: ['$DIRECT_SOCKETS'],
+  $DIRECT_SOCKETS_PIPES__deps: ['$DIRECT_SOCKETS', '$FS'],
   $DIRECT_SOCKETS_PIPES: {
     pipes: {},
 
+    // Pipe stream_ops for FS integration (so fd_write/fd_read work on pipe fds)
+    stream_ops: {
+      read(stream, buffer, offset, length, position) {
+        var fd = stream.fd;
+        var data = DIRECT_SOCKETS_PIPES.readPipe(fd, length);
+        if (!data) throw new FS.ErrnoError({{{ cDefs.EAGAIN }}});
+        if (data.length === 0) return 0; // EOF
+        for (var i = 0; i < data.length; i++) {
+          buffer[offset + i] = data[i];
+        }
+        return data.length;
+      },
+      write(stream, buffer, offset, length, position) {
+        var fd = stream.fd;
+        var data = new Uint8Array(length);
+        for (var i = 0; i < length; i++) {
+          data[i] = buffer[offset + i];
+        }
+        var result = DIRECT_SOCKETS_PIPES.writePipe(fd, data);
+        if (result < 0) throw new FS.ErrnoError(-result);
+        return result;
+      },
+      poll(stream) {
+        var fd = stream.fd;
+        return DIRECT_SOCKETS_PIPES.computeRevents(fd, 5 /*POLLIN|POLLOUT*/);
+      },
+      close(stream) {
+        DIRECT_SOCKETS_PIPES.closePipeFd(stream.fd);
+      },
+    },
+
+    // Allocate an FS-backed fd for a pipe end
+    allocatePipeFd(name) {
+      DIRECT_SOCKETS.ensureRoot();
+      var node = FS.createNode(DIRECT_SOCKETS.root, name, {{{ cDefs.S_IFIFO }}} | 438 /* 0666 */, 0);
+      var stream = FS.createStream({
+        path: name,
+        node: node,
+        flags: {{{ cDefs.O_RDWR }}},
+        seekable: false,
+        stream_ops: DIRECT_SOCKETS_PIPES.stream_ops,
+      });
+      return stream.fd;
+    },
+
     createPipe() {
-      var readFd = DIRECT_SOCKETS.allocateFd();
-      var writeFd = DIRECT_SOCKETS.allocateFd();
+      var readFd = DIRECT_SOCKETS_PIPES.allocatePipeFd('pipe[r' + Object.keys(DIRECT_SOCKETS_PIPES.pipes).length + ']');
+      var writeFd = DIRECT_SOCKETS_PIPES.allocatePipeFd('pipe[w' + Object.keys(DIRECT_SOCKETS_PIPES.pipes).length + ']');
       var pipe = {
         buffer: [],          // array of Uint8Array chunks
         closed: { read: false, write: false },
@@ -567,32 +624,33 @@ var DirectSocketsLibrary = {
 
     computeRevents(fd, events) {
       var entry = DIRECT_SOCKETS_PIPES.pipes[fd];
-      if (!entry) return 32; // POLLNVAL
+      if (!entry) return {{{ cDefs.POLLNVAL }}};
+      var POLLRDNORM = 64, POLLWRNORM = 256;
       var revents = 0;
 
       if (entry.writePipe) {
         // Socketpair fd: can both read and write
         var readPipe = entry.pipe;
         var writePipe = entry.writePipe;
-        if (events & 1 /*POLLIN*/) {
-          if (readPipe.buffer.length > 0) revents |= 1 | 64;
+        if (events & {{{ cDefs.POLLIN }}}) {
+          if (readPipe.buffer.length > 0) revents |= {{{ cDefs.POLLIN }}} | POLLRDNORM;
         }
-        if (readPipe.closed.write && readPipe.buffer.length === 0) revents |= 16; // POLLHUP
-        if (events & 4 /*POLLOUT*/) {
-          if (!writePipe.closed.read) revents |= 4 | 256;
+        if (readPipe.closed.write && readPipe.buffer.length === 0) revents |= {{{ cDefs.POLLHUP }}};
+        if (events & {{{ cDefs.POLLOUT }}}) {
+          if (!writePipe.closed.read) revents |= {{{ cDefs.POLLOUT }}} | POLLWRNORM;
         }
       } else if (entry.end === 'read') {
         var pipe = entry.pipe;
-        if (events & 1 /*POLLIN*/) {
-          if (pipe.buffer.length > 0) revents |= 1 | 64; // POLLIN | POLLRDNORM
+        if (events & {{{ cDefs.POLLIN }}}) {
+          if (pipe.buffer.length > 0) revents |= {{{ cDefs.POLLIN }}} | POLLRDNORM;
         }
-        if (pipe.closed.write && pipe.buffer.length === 0) revents |= 16; // POLLHUP
+        if (pipe.closed.write && pipe.buffer.length === 0) revents |= {{{ cDefs.POLLHUP }}};
       } else {
         var pipe = entry.pipe;
-        if (events & 4 /*POLLOUT*/) {
-          if (!pipe.closed.read) revents |= 4 | 256; // POLLOUT | POLLWRNORM
+        if (events & {{{ cDefs.POLLOUT }}}) {
+          if (!pipe.closed.read) revents |= {{{ cDefs.POLLOUT }}} | POLLWRNORM;
         }
-        if (pipe.closed.read) revents |= 8; // POLLERR (broken pipe)
+        if (pipe.closed.read) revents |= {{{ cDefs.POLLERR }}};
       }
       return revents;
     },
@@ -602,7 +660,6 @@ var DirectSocketsLibrary = {
   // Syscall implementations
   // ---------------------------------------------------------------------------
 
-  __syscall_socket__deps: ['$DIRECT_SOCKETS'],
   __syscall_socket: (domain, type, protocol) => {
     // Strip flags that don't apply in single-process context
     type &= ~({{{ cDefs.SOCK_CLOEXEC | cDefs.SOCK_NONBLOCK }}});
@@ -634,15 +691,15 @@ var DirectSocketsLibrary = {
     return sock.fd;
   },
 
-  __syscall_connect__deps: ['$DIRECT_SOCKETS'],
   __syscall_connect__async: true,
   __syscall_connect: async (fd, addr, addrlen) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
     if (!sock) return -{{{ cDefs.EBADF }}};
     if (sock.state === 'connected' || sock.state === 'connecting') return -{{{ cDefs.EISCONN }}};
+    if (sock.state !== 'created' && sock.state !== 'bound') return -{{{ cDefs.EINVAL }}};
 
     var dest = DIRECT_SOCKETS.parseSockaddr(addr, addrlen);
-    if (!dest) return -{{{ cDefs.EINVAL }}};
+    if (dest.errno) return -dest.errno;
 
 #if SOCKET_DEBUG
     dbg(`direct_sockets: connect(fd=${fd}, addr=${dest.addr}, port=${dest.port})`);
@@ -652,8 +709,15 @@ var DirectSocketsLibrary = {
 
     try {
       if (sock.type === {{{ cDefs.SOCK_STREAM }}}) {
-        // TCP connect
+        // TCP connect - pass local endpoint from prior bind() if present
+        if (typeof TCPSocket === 'undefined') return -{{{ cDefs.ENOSYS }}};
         var opts = DIRECT_SOCKETS.buildTCPOptions(sock);
+        if (sock.localAddress && sock.localAddress !== '0.0.0.0') {
+          opts.localAddress = sock.localAddress;
+        }
+        if (sock.localPort) {
+          opts.localPort = sock.localPort;
+        }
         var tcpSocket = new TCPSocket(dest.addr, dest.port, opts);
         var openInfo = await tcpSocket.opened;
 
@@ -662,8 +726,8 @@ var DirectSocketsLibrary = {
         sock.writer = openInfo.writable.getWriter();
         sock.remoteAddress = openInfo.remoteAddress || dest.addr;
         sock.remotePort = openInfo.remotePort || dest.port;
-        sock.localAddress = openInfo.localAddress || '0.0.0.0';
-        sock.localPort = openInfo.localPort || 0;
+        sock.localAddress = openInfo.localAddress || sock.localAddress || '0.0.0.0';
+        sock.localPort = openInfo.localPort || sock.localPort || 0;
         sock.state = 'connected';
 
         // Start background reader for poll/non-blocking support
@@ -671,9 +735,27 @@ var DirectSocketsLibrary = {
 
       } else {
         // UDP "connect" - creates a connected-mode UDPSocket
+        // Close existing UDP socket from prior bind() to avoid leaking
+        if (sock.udpSocket) {
+          try {
+            if (sock.reader) { sock.reader.releaseLock(); sock.reader = null; }
+            if (sock.writer) { sock.writer.releaseLock(); sock.writer = null; }
+            await sock.udpSocket.close();
+          } catch (e) {}
+          sock.udpSocket = null;
+        }
+
+        if (typeof UDPSocket === 'undefined') return -{{{ cDefs.ENOSYS }}};
         var opts = DIRECT_SOCKETS.buildUDPOptions(sock);
         opts.remoteAddress = dest.addr;
         opts.remotePort = dest.port;
+        // Honor local endpoint from prior bind()
+        if (sock.localAddress && sock.localAddress !== '0.0.0.0') {
+          opts.localAddress = sock.localAddress;
+        }
+        if (sock.localPort) {
+          opts.localPort = sock.localPort;
+        }
         var udpSocket = new UDPSocket(opts);
         var openInfo = await udpSocket.opened;
 
@@ -683,8 +765,8 @@ var DirectSocketsLibrary = {
         DIRECT_SOCKETS.attachMulticastController(sock, openInfo);
         sock.remoteAddress = openInfo.remoteAddress || dest.addr;
         sock.remotePort = openInfo.remotePort || dest.port;
-        sock.localAddress = openInfo.localAddress || '0.0.0.0';
-        sock.localPort = openInfo.localPort || 0;
+        sock.localAddress = openInfo.localAddress || sock.localAddress || '0.0.0.0';
+        sock.localPort = openInfo.localPort || sock.localPort || 0;
         sock.state = 'connected';
 
         // Start background reader for poll/non-blocking support
@@ -702,7 +784,6 @@ var DirectSocketsLibrary = {
     return 0;
   },
 
-  __syscall_bind__deps: ['$DIRECT_SOCKETS'],
   __syscall_bind__async: true,
   __syscall_bind: async (fd, addr, addrlen) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -710,7 +791,7 @@ var DirectSocketsLibrary = {
     if (sock.state !== 'created') return -{{{ cDefs.EINVAL }}};
 
     var bindAddr = DIRECT_SOCKETS.parseSockaddr(addr, addrlen);
-    if (!bindAddr) return -{{{ cDefs.EINVAL }}};
+    if (bindAddr.errno) return -bindAddr.errno;
 
 #if SOCKET_DEBUG
     dbg(`direct_sockets: bind(fd=${fd}, addr=${bindAddr.addr}, port=${bindAddr.port})`);
@@ -723,6 +804,7 @@ var DirectSocketsLibrary = {
 
     if (sock.type === {{{ cDefs.SOCK_DGRAM }}}) {
       // UDP: create bound-mode UDPSocket immediately
+      if (typeof UDPSocket === 'undefined') return -{{{ cDefs.ENOSYS }}};
       try {
         var opts = DIRECT_SOCKETS.buildUDPOptions(sock);
         opts.localAddress = bindAddr.addr;
@@ -755,7 +837,6 @@ var DirectSocketsLibrary = {
     return 0;
   },
 
-  __syscall_listen__deps: ['$DIRECT_SOCKETS'],
   __syscall_listen__async: true,
   __syscall_listen: async (fd, backlog) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -767,6 +848,7 @@ var DirectSocketsLibrary = {
     dbg(`direct_sockets: listen(fd=${fd}, backlog=${backlog})`);
 #endif
 
+    if (typeof TCPServerSocket === 'undefined') return -{{{ cDefs.ENOSYS }}};
     try {
       var opts = {};
       if (sock.localPort) opts.localPort = sock.localPort;
@@ -791,7 +873,7 @@ var DirectSocketsLibrary = {
     return 0;
   },
 
-  __syscall_accept4__deps: ['$DIRECT_SOCKETS', '$writeSockaddr', '$DNS'],
+  __syscall_accept4__deps: ['$writeSockaddr', '$DNS'],
   __syscall_accept4__async: true,
   __syscall_accept4: async (fd, addr, addrlen, flags) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -846,7 +928,6 @@ var DirectSocketsLibrary = {
     }
   },
 
-  __syscall_sendto__deps: ['$DIRECT_SOCKETS'],
   __syscall_sendto__async: true,
   __syscall_sendto: async (fd, message, length, flags, addr, addr_len) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -870,7 +951,7 @@ var DirectSocketsLibrary = {
       if (addr && addr_len > 0) {
         // sendto with explicit destination (requires bound-mode UDP)
         var dest = DIRECT_SOCKETS.parseSockaddr(addr, addr_len);
-        if (!dest) return -{{{ cDefs.EINVAL }}};
+        if (dest.errno) return -dest.errno;
 
 #if SOCKET_DEBUG
         dbg(`direct_sockets: sendto(fd=${fd}, length=${length}, dest=${dest.addr}:${dest.port})`);
@@ -915,7 +996,7 @@ var DirectSocketsLibrary = {
     }
   },
 
-  __syscall_recvfrom__deps: ['$DIRECT_SOCKETS', '$writeSockaddr', '$DNS'],
+  __syscall_recvfrom__deps: ['$writeSockaddr', '$DNS'],
   __syscall_recvfrom__async: true,
   __syscall_recvfrom: async (fd, buf, len, flags, addr, addrlen) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -931,6 +1012,7 @@ var DirectSocketsLibrary = {
 
       var data = await DIRECT_SOCKETS.readFromSocket(sock, len);
       if (data === 'EAGAIN') return -{{{ cDefs.EAGAIN }}};
+      if (typeof data === 'number') return data;  // Error code (negative errno)
       if (!data) return 0;  // Connection closed (EOF)
 
       HEAPU8.set(data, buf);
@@ -984,7 +1066,6 @@ var DirectSocketsLibrary = {
     }
   },
 
-  __syscall_shutdown__deps: ['$DIRECT_SOCKETS'],
   __syscall_shutdown__async: true,
   __syscall_shutdown: async (fd, how) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -1020,7 +1101,7 @@ var DirectSocketsLibrary = {
     return 0;
   },
 
-  __syscall_getsockname__deps: ['$DIRECT_SOCKETS', '$writeSockaddr', '$DNS'],
+  __syscall_getsockname__deps: ['$writeSockaddr', '$DNS'],
   __syscall_getsockname: (fd, addr, addrlen) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
     if (!sock) return -{{{ cDefs.EBADF }}};
@@ -1032,7 +1113,7 @@ var DirectSocketsLibrary = {
     return errno ? -{{{ cDefs.EINVAL }}} : 0;
   },
 
-  __syscall_getpeername__deps: ['$DIRECT_SOCKETS', '$writeSockaddr', '$DNS'],
+  __syscall_getpeername__deps: ['$writeSockaddr', '$DNS'],
   __syscall_getpeername: (fd, addr, addrlen) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
     if (!sock) return -{{{ cDefs.EBADF }}};
@@ -1043,7 +1124,6 @@ var DirectSocketsLibrary = {
     return errno ? -{{{ cDefs.EINVAL }}} : 0;
   },
 
-  __syscall_setsockopt__deps: ['$DIRECT_SOCKETS'],
   __syscall_setsockopt__async: true,
   __syscall_setsockopt: async (fd, level, optname, optval, optlen) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -1055,19 +1135,28 @@ var DirectSocketsLibrary = {
 
     // Direct Sockets only supports a few options, and they must be set at
     // construction time. We defer them and apply when connect/bind is called.
-    if (level === 1 /*SOL_SOCKET*/) {
+    // musl socket option constants (stable ABI):
+    var SO_REUSEADDR = 2, SO_TYPE = 3, SO_SNDBUF = 7, SO_RCVBUF = 8;
+    var SO_KEEPALIVE = 9, SO_REUSEPORT = 15;
+    var TCP_NODELAY = 1, TCP_KEEPIDLE = 4, TCP_KEEPINTVL = 5;
+    var IP_MULTICAST_TTL = 33, IP_MULTICAST_LOOP = 34;
+    var IP_ADD_MEMBERSHIP = 35, IP_DROP_MEMBERSHIP = 36;
+    var IPV6_MULTICAST_LOOP = 18, IPV6_MULTICAST_HOPS = 19;
+    var IPV6_JOIN_GROUP = 20, IPV6_LEAVE_GROUP = 21;
+
+    if (level === {{{ cDefs.SOL_SOCKET }}}) {
       switch (optname) {
-        case 2: // SO_REUSEADDR
-        case 15: // SO_REUSEPORT
+        case SO_REUSEADDR:
+        case SO_REUSEPORT:
           // Silently accept - no equivalent, but harmless
           return 0;
-        case 7: // SO_SNDBUF
+        case SO_SNDBUF:
           sock.options.sendBufferSize = {{{ makeGetValue('optval', 0, 'i32') }}};
           return 0;
-        case 8: // SO_RCVBUF
+        case SO_RCVBUF:
           sock.options.receiveBufferSize = {{{ makeGetValue('optval', 0, 'i32') }}};
           return 0;
-        case 9: // SO_KEEPALIVE
+        case SO_KEEPALIVE:
           // Will be used as keepAliveDelay if enabled - use a default of 60s
           var enabled = {{{ makeGetValue('optval', 0, 'i32') }}};
           if (enabled && sock.options.keepAliveDelay === 0) {
@@ -1083,13 +1172,13 @@ var DirectSocketsLibrary = {
 #endif
           return 0;
       }
-    } else if (level === 6 /*IPPROTO_TCP*/) {
+    } else if (level === {{{ cDefs.IPPROTO_TCP }}}) {
       switch (optname) {
-        case 1:  // TCP_NODELAY (musl value = 1)
+        case TCP_NODELAY:
           sock.options.noDelay = !!{{{ makeGetValue('optval', 0, 'i32') }}};
           return 0;
-        case 4:  // TCP_KEEPIDLE (musl value = 4)
-        case 5:  // TCP_KEEPINTVL (musl value = 5)
+        case TCP_KEEPIDLE:
+        case TCP_KEEPINTVL:
           // Map to keepAliveDelay (in milliseconds)
           sock.options.keepAliveDelay = {{{ makeGetValue('optval', 0, 'i32') }}} * 1000;
           return 0;
@@ -1099,32 +1188,32 @@ var DirectSocketsLibrary = {
 #endif
           return 0;
       }
-    } else if (level === 0 /*IPPROTO_IP*/) {
+    } else if (level === {{{ cDefs.IPPROTO_IP }}}) {
       switch (optname) {
-        case 33: // IP_MULTICAST_TTL
+        case IP_MULTICAST_TTL:
           sock.options.multicastTtl = HEAPU8[optval];
           return 0;
-        case 34: // IP_MULTICAST_LOOP
+        case IP_MULTICAST_LOOP:
           sock.options.multicastLoopback = !!HEAPU8[optval];
           return 0;
-        case 35: // IP_ADD_MEMBERSHIP
+        case IP_ADD_MEMBERSHIP:
           return DIRECT_SOCKETS.joinMulticastGroup(sock, DIRECT_SOCKETS.parseIpMreq(optval, optlen));
-        case 36: // IP_DROP_MEMBERSHIP
+        case IP_DROP_MEMBERSHIP:
           return DIRECT_SOCKETS.leaveMulticastGroup(sock, DIRECT_SOCKETS.parseIpMreq(optval, optlen));
         default:
           return 0;
       }
-    } else if (level === 41 /*IPPROTO_IPV6*/) {
+    } else if (level === {{{ cDefs.IPPROTO_IPV6 }}}) {
       switch (optname) {
-        case 18: // IPV6_MULTICAST_LOOP
+        case IPV6_MULTICAST_LOOP:
           sock.options.multicastLoopback = !!HEAPU8[optval];
           return 0;
-        case 19: // IPV6_MULTICAST_HOPS
+        case IPV6_MULTICAST_HOPS:
           sock.options.multicastTtl = HEAPU8[optval];
           return 0;
-        case 20: // IPV6_JOIN_GROUP
+        case IPV6_JOIN_GROUP:
           return DIRECT_SOCKETS.joinMulticastGroup(sock, DIRECT_SOCKETS.parseIpv6Mreq(optval, optlen));
-        case 21: // IPV6_LEAVE_GROUP
+        case IPV6_LEAVE_GROUP:
           return DIRECT_SOCKETS.leaveMulticastGroup(sock, DIRECT_SOCKETS.parseIpv6Mreq(optval, optlen));
         default:
           return 0;
@@ -1135,19 +1224,19 @@ var DirectSocketsLibrary = {
     return 0;
   },
 
-  __syscall_getsockopt__deps: ['$DIRECT_SOCKETS'],
   __syscall_getsockopt: (fd, level, optname, optval, optlen) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
     if (!sock) return -{{{ cDefs.EBADF }}};
 
-    if (level === 1 /*SOL_SOCKET*/) {
+    var SO_TYPE = 3;
+    if (level === {{{ cDefs.SOL_SOCKET }}}) {
       if (optname === {{{ cDefs.SO_ERROR }}}) {
         {{{ makeSetValue('optval', 0, 'sock.error', 'i32') }}};
         {{{ makeSetValue('optlen', 0, 4, 'i32') }}};
         sock.error = 0;
         return 0;
       }
-      if (optname === 3 /*SO_TYPE*/) {
+      if (optname === SO_TYPE) {
         {{{ makeSetValue('optval', 0, 'sock.type', 'i32') }}};
         {{{ makeSetValue('optlen', 0, 4, 'i32') }}};
         return 0;
@@ -1158,7 +1247,7 @@ var DirectSocketsLibrary = {
   },
 
   // sendmsg/recvmsg: minimal implementations that delegate to sendto/recvfrom
-  __syscall_sendmsg__deps: ['$DIRECT_SOCKETS', '__syscall_sendto'],
+  __syscall_sendmsg__deps: ['__syscall_sendto'],
   __syscall_sendmsg__async: true,
   __syscall_sendmsg: async (fd, message, flags) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -1191,7 +1280,7 @@ var DirectSocketsLibrary = {
     } else {
       if (name && namelen > 0) {
         var dest = DIRECT_SOCKETS.parseSockaddr(name, namelen);
-        if (!dest) return -{{{ cDefs.EINVAL }}};
+        if (dest.errno) return -dest.errno;
         if (sock.state === 'bound' && sock.writer) {
           try {
             await sock.writer.write({ data: view, remoteAddress: dest.addr, remotePort: dest.port });
@@ -1212,7 +1301,7 @@ var DirectSocketsLibrary = {
     }
   },
 
-  __syscall_recvmsg__deps: ['$DIRECT_SOCKETS', '$writeSockaddr', '$DNS'],
+  __syscall_recvmsg__deps: ['$writeSockaddr', '$DNS'],
   __syscall_recvmsg__async: true,
   __syscall_recvmsg: async (fd, message, flags) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
@@ -1231,6 +1320,7 @@ var DirectSocketsLibrary = {
       if (sock.state !== 'connected') return -{{{ cDefs.ENOTCONN }}};
       var data = await DIRECT_SOCKETS.readFromSocket(sock, total);
       if (data === 'EAGAIN') return -{{{ cDefs.EAGAIN }}};
+      if (typeof data === 'number') return data;  // Error code (negative errno)
       if (!data) return 0;
 
       // Scatter into iovecs
@@ -1296,7 +1386,7 @@ var DirectSocketsLibrary = {
   // poll() implementation
   // ---------------------------------------------------------------------------
 
-  __syscall_poll__deps: ['$DIRECT_SOCKETS', '$DIRECT_SOCKETS_PIPES'],
+  __syscall_poll__deps: ['$DIRECT_SOCKETS_PIPES'],
   __syscall_poll__async: true,
   __syscall_poll: async (fds, nfds, timeout) => {
     // struct pollfd { int fd; short events; short revents; }
@@ -1439,11 +1529,11 @@ var DirectSocketsLibrary = {
   // socketpair() implementation
   // ---------------------------------------------------------------------------
 
-  __syscall_socketpair__deps: ['$DIRECT_SOCKETS', '$DIRECT_SOCKETS_PIPES'],
+  __syscall_socketpair__deps: ['$DIRECT_SOCKETS_PIPES'],
   __syscall_socketpair: (domain, type, protocol, sv) => {
     // Two cross-connected pipes: fd0's write goes to fd1's read and vice versa
-    var fd0 = DIRECT_SOCKETS.allocateFd();
-    var fd1 = DIRECT_SOCKETS.allocateFd();
+    var fd0 = DIRECT_SOCKETS_PIPES.allocatePipeFd('sockpair[0.' + Object.keys(DIRECT_SOCKETS_PIPES.pipes).length + ']');
+    var fd1 = DIRECT_SOCKETS_PIPES.allocatePipeFd('sockpair[1.' + Object.keys(DIRECT_SOCKETS_PIPES.pipes).length + ']');
 
     // Create pipe objects directly (no intermediate fds needed)
     var spPipe0to1 = {
@@ -1475,21 +1565,20 @@ var DirectSocketsLibrary = {
   // fcntl64 - F_GETFL / F_SETFL for O_NONBLOCK support
   // ---------------------------------------------------------------------------
 
-  __syscall_fcntl64__deps: ['$DIRECT_SOCKETS', '$DIRECT_SOCKETS_PIPES'],
+  __syscall_fcntl64__deps: ['$DIRECT_SOCKETS_PIPES'],
   __syscall_fcntl64: (fd, cmd, varargs) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
     var pipeEntry = DIRECT_SOCKETS_PIPES.getPipe(fd);
 
     if (!sock && !pipeEntry) return -{{{ cDefs.EBADF }}};
 
-    // F_GETFL = 3, F_SETFL = 4 (musl values)
-    if (cmd === 3 /*F_GETFL*/) {
+    if (cmd === {{{ cDefs.F_GETFL }}}) {
       if (sock) {
         return sock.nonBlocking ? {{{ cDefs.O_NONBLOCK }}} : 0;
       }
       return 0;
     }
-    if (cmd === 4 /*F_SETFL*/) {
+    if (cmd === {{{ cDefs.F_SETFL }}}) {
       var flags = {{{ makeGetValue('varargs', 0, 'i32') }}};
       if (sock) {
         sock.nonBlocking = !!(flags & {{{ cDefs.O_NONBLOCK }}});
@@ -1497,9 +1586,8 @@ var DirectSocketsLibrary = {
       }
       return 0;
     }
-    // F_GETFD = 1, F_SETFD = 2 (FD_CLOEXEC etc - silently accept)
-    if (cmd === 1 /*F_GETFD*/) return 0;
-    if (cmd === 2 /*F_SETFD*/) return 0;
+    if (cmd === {{{ cDefs.F_GETFD }}}) return 0;
+    if (cmd === {{{ cDefs.F_SETFD }}}) return 0;
 
     return -{{{ cDefs.EINVAL }}};
   },
@@ -1508,13 +1596,12 @@ var DirectSocketsLibrary = {
   // ioctl - FIONBIO for non-blocking support
   // ---------------------------------------------------------------------------
 
-  __syscall_ioctl__deps: ['$DIRECT_SOCKETS'],
+  // ioctl for FIONBIO / FIONREAD
   __syscall_ioctl: (fd, op, varargs) => {
     var sock = DIRECT_SOCKETS.getSocket(fd);
     if (!sock) return -{{{ cDefs.EBADF }}};
 
-    // FIONBIO = 0x5421 (musl)
-    if (op === 0x5421) {
+    if (op === {{{ cDefs.FIONBIO }}}) {
       var val = {{{ makeGetValue('varargs', 0, 'i32') }}};
       var nonblock = {{{ makeGetValue('val', 0, 'i32') }}};
       sock.nonBlocking = !!nonblock;
@@ -1524,8 +1611,7 @@ var DirectSocketsLibrary = {
       return 0;
     }
 
-    // FIONREAD = 0x541B - return bytes available to read
-    if (op === 0x541B) {
+    if (op === {{{ cDefs.FIONREAD }}}) {
       var argp = {{{ makeGetValue('varargs', 0, 'i32') }}};
       var avail = 0;
       for (var i = 0; i < sock.recvQueue.length; i++) {
@@ -1543,7 +1629,7 @@ var DirectSocketsLibrary = {
   // DNS resolution - async DoH-based getaddrinfo support
   // ---------------------------------------------------------------------------
 
-  _emscripten_lookup_name__deps: ['$DIRECT_SOCKETS', '$DNS', '$inetPton4'],
+  _emscripten_lookup_name__deps: ['$DNS', '$inetPton4'],
   _emscripten_lookup_name__async: true,
   _emscripten_lookup_name: async (name) => {
     var hostname = UTF8ToString(name);
@@ -1616,6 +1702,8 @@ var DirectSocketsLibrary = {
     };
   `,
 };
+
+autoAddDeps(DirectSocketsLibrary, '$DIRECT_SOCKETS');
 
 for (var x in DirectSocketsLibrary) {
   if (x.startsWith('__syscall_')) {
